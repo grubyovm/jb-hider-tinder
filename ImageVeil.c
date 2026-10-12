@@ -30,22 +30,36 @@
  *      iOS 18 regardless of Memory.protect("rwx"). This hook sidesteps that
  *      by intercepting the FUNCTIONS instead of writing to the struct.
  *
- * STATUS (2026-10-12, live device): dylib confirmed loaded via TweakInject
- * (present in a real crash log's usedImages), but Tinder still crashed at
- * the EXACT SAME address (FaceTecSDK+0x18E70C) as before the hook existed.
- * The hook therefore did not take effect, for an UNCONFIRMED reason -- the
- * logging below exists to find out which of these is actually happening,
- * from a real on-disk log file instead of guessing:
- *   (a) MSHookFunction not found via dlsym at constructor time,
- *   (b) one or more of the 4 dlsym lookups for the target symbols failing,
- *   (c) MSHookFunction call(s) silently no-op'ing (e.g. target function too
- *       short to patch -- a known limitation of inline hooking on very
- *       short libsystem_kernel.dylib mach-trap stubs),
- *   (d) hooks installed and firing, but filtering logic wrong,
- *   (e) hooks installed and firing correctly, but InitFunc_1 reaching the
- *       crash through some OTHER path entirely (e.g. a different image in
- *       the list not covered by kBlocked, or a cross-check we haven't
- *       mapped).
+ * HISTORY (2026-10-12, live device):
+ *   - First working build (dylib loaded, all 4 hooks installed per the
+ *     on-disk log, filtering logic ran correctly) still crashed Tinder --
+ *     but at a DIFFERENT address, ~0.86s after launch, EXC_BAD_ACCESS/NULL
+ *     deref inside Tinder's own code on a background dispatch queue, with
+ *     FaceTecSDK not even loaded yet. The on-disk log's last line was
+ *     Hooked_task_info swapping in our fake dyld_all_image_infos -- i.e. the
+ *     crash followed immediately. Root cause: the global hook on
+ *     _dyld_image_count/_dyld_get_image_header/_dyld_get_image_name/
+ *     task_info patches the function for EVERY caller in the process, not
+ *     just FaceTecSDK. Sentry (visible in the crash log: io.sentry.default
+ *     queue, SentryCrash Exception Handler threads) calls
+ *     task_info(TASK_DYLD_INFO) too, for its own crash-symbolication image
+ *     list, and reads fields of dyld_all_image_infos beyond
+ *     version/infoArrayCount/infoArray (e.g. uuidArray,
+ *     dyldAllImageInfosAddress, sharedCache info) -- our fake struct only
+ *     populated those 3 fields and calloc'd the rest to zero, so any such
+ *     read landed on a NULL pointer.
+ *   - FIX (this version), per explicit instruction: scope the filtering to
+ *     FaceTecSDK ONLY. Every Hooked_* function now checks its caller's
+ *     return address via dladdr() and only applies the filtered/fake view
+ *     when the caller's image path contains "FaceTecSDK"; every other
+ *     caller (Sentry, Swift runtime, anything else) gets the real,
+ *     unmodified data straight from orig_*. This removes the collateral-
+ *     damage class of bug entirely, independent of the struct-field issue.
+ *   - Also fixed defensively: BuildFakeAllImageInfos now copies the ENTIRE
+ *     real struct (`*fake = *realAII`) before overriding infoArrayCount/
+ *     infoArray, instead of calloc'ing a 3-field struct -- so even a
+ *     FaceTecSDK code path that reads some other field we didn't think of
+ *     gets the real value, not a zeroed one.
  *
  * Deploy: drop ImageVeil.dylib + ImageVeil.plist (same basename) into
  *   /var/jb/usr/lib/TweakInject/
@@ -53,8 +67,6 @@
  * sandboxed app can reliably write -- NOT /var/mobile, NOT /var/jb). On the device:
  *   find /var/mobile/Containers/Data/Application -name jbhide_log.txt
  *   cat  <the path it prints>
- * (path is .../Data/Application/<GUID>/Documents/jbhide_log.txt; the GUID changes
- *  per install, so use find rather than hardcoding it).
  */
 
 #include <stdio.h>
@@ -79,7 +91,7 @@ static void JBLog(const char *fmt, ...) {
     // Write into the app's OWN Data container, which a sandboxed app can ALWAYS write to (no jailbreak path, no
     // /var/jb, no /var/mobile rootfs). The container path is resolved at runtime via NSHomeDirectory() (looked up
     // with dlsym -- Foundation is already loaded in Tinder, so nothing extra needs to be linked at build time).
-    // We do NOT use getenv("HOME") -- it is unreliable in this process. Resulting file:
+    // Resulting file:
     //   /var/mobile/Containers/Data/Application/<GUID>/Documents/jbhide_log.txt
     // Find it on the device (shell / Filza):
     //   find /var/mobile/Containers/Data/Application -name jbhide_log.txt
@@ -115,9 +127,7 @@ static void JBLog(const char *fmt, ...) {
     write(fd, "\n", 1);
 }
 
-#pragma mark - MSHookFunction, resolved at runtime (ElleKit is already loaded
-#pragma mark   in-process -- TweakInject can't work without it -- so no SDK
-#pragma mark   header/lib dependency needed at build time)
+#pragma mark - MSHookFunction, resolved at runtime via ElleKit
 
 typedef void (*MSHookFunction_t)(void *symbol, void *replace, void **result);
 
@@ -139,6 +149,17 @@ static bool PathBlocked(const char *path) {
     return false;
 }
 
+#pragma mark - Caller scoping: only filter for FaceTecSDK, pass real data to
+#pragma mark   every other caller (Sentry, Swift runtime, etc.)
+
+static bool CallerIsFaceTecSDK(void *retAddr) {
+    Dl_info info;
+    if (dladdr(retAddr, &info) && info.dli_fname) {
+        return strstr(info.dli_fname, "FaceTecSDK") != NULL;
+    }
+    return false;
+}
+
 #pragma mark - _dyld_image_count / _dyld_get_image_header / _dyld_get_image_name
 
 static uint32_t (*orig_dyld_image_count)(void);
@@ -156,7 +177,6 @@ static void BuildVisibleList(void) {
     for (uint32_t i = 0; i < real; i++) {
         const char *name = orig_dyld_get_image_name ? orig_dyld_get_image_name(i) : NULL;
         bool blocked = PathBlocked(name);
-        JBLog("[BuildVisibleList] i=%u name=%s blocked=%d", i, name ? name : "(null)", blocked);
         if (!blocked) tmp[n++] = i;
     }
     g_visible = tmp;
@@ -165,23 +185,29 @@ static void BuildVisibleList(void) {
 }
 
 static uint32_t Hooked_dyld_image_count(void) {
+    if (!CallerIsFaceTecSDK(__builtin_return_address(0)))
+        return orig_dyld_image_count();
     pthread_once(&g_visibleOnce, BuildVisibleList);
-    JBLog("[Hooked_dyld_image_count] -> %u", g_visibleCount);
+    JBLog("[Hooked_dyld_image_count] FaceTecSDK caller -> %u", g_visibleCount);
     return g_visibleCount;
 }
 
 static const struct mach_header *Hooked_dyld_get_image_header(uint32_t idx) {
+    if (!CallerIsFaceTecSDK(__builtin_return_address(0)))
+        return orig_dyld_get_image_header(idx);
     pthread_once(&g_visibleOnce, BuildVisibleList);
     if (idx >= g_visibleCount) {
-        JBLog("[Hooked_dyld_get_image_header] idx=%u >= visibleCount=%u -> NULL", idx, g_visibleCount);
+        JBLog("[Hooked_dyld_get_image_header] FaceTecSDK idx=%u >= visibleCount=%u -> NULL", idx, g_visibleCount);
         return NULL;
     }
     const struct mach_header *h = orig_dyld_get_image_header(g_visible[idx]);
-    JBLog("[Hooked_dyld_get_image_header] idx=%u -> real_idx=%u header=%p", idx, g_visible[idx], h);
+    JBLog("[Hooked_dyld_get_image_header] FaceTecSDK idx=%u -> real_idx=%u header=%p", idx, g_visible[idx], h);
     return h;
 }
 
 static const char *Hooked_dyld_get_image_name(uint32_t idx) {
+    if (!CallerIsFaceTecSDK(__builtin_return_address(0)))
+        return orig_dyld_get_image_name(idx);
     pthread_once(&g_visibleOnce, BuildVisibleList);
     if (idx >= g_visibleCount) return NULL;
     return orig_dyld_get_image_name(g_visible[idx]);
@@ -220,9 +246,15 @@ static void BuildFakeAllImageInfos(void) {
         if (!PathBlocked(entry.imageFilePath)) filtered[kept++] = entry;
     }
 
+    // Copy the WHOLE real struct first (preserves uuidArray, dyldAllImageInfosAddress,
+    // sharedCache fields, notification pointers, everything we don't know about) --
+    // then override only the two fields we actually mean to change. A previous version
+    // calloc'd a bare 3-field struct, which was fine for FaceTecSDK's own reads but
+    // crashed any OTHER caller reading a field we'd zeroed -- moot now that this is
+    // caller-scoped to FaceTecSDK only, but kept as defense in depth.
     struct dyld_all_image_infos *fake =
-        (struct dyld_all_image_infos *)calloc(1, sizeof(*fake));
-    fake->version = realAII->version;
+        (struct dyld_all_image_infos *)malloc(sizeof(*fake));
+    *fake = *realAII;
     fake->infoArrayCount = kept;
     fake->infoArray = filtered;
     g_fakeAII = fake;
@@ -232,13 +264,12 @@ static void BuildFakeAllImageInfos(void) {
 static kern_return_t Hooked_task_info(task_t target, task_flavor_t flavor,
                                        task_info_t info, mach_msg_type_number_t *cnt) {
     kern_return_t kr = orig_task_info(target, flavor, info, cnt);
-    if (kr == KERN_SUCCESS && flavor == TASK_DYLD_INFO && target == mach_task_self()) {
+    if (kr == KERN_SUCCESS && flavor == TASK_DYLD_INFO && target == mach_task_self()
+        && CallerIsFaceTecSDK(__builtin_return_address(0))) {
         pthread_once(&g_fakeOnce, BuildFakeAllImageInfos);
         if (g_fakeAII) {
-            JBLog("[Hooked_task_info] TASK_DYLD_INFO on self -> swapping in fakeAII=%p", (void *)g_fakeAII);
+            JBLog("[Hooked_task_info] FaceTecSDK caller, TASK_DYLD_INFO on self -> swapping in fakeAII=%p", (void *)g_fakeAII);
             ((task_dyld_info_t)info)->all_image_info_addr = (uint64_t)g_fakeAII;
-        } else {
-            JBLog("[Hooked_task_info] TASK_DYLD_INFO on self but g_fakeAII is NULL -- passing real struct through");
         }
     }
     return kr;
@@ -254,10 +285,7 @@ static void ImageVeilInit(void) {
         (MSHookFunction_t)dlsym(RTLD_DEFAULT, "MSHookFunction");
     if (!MSHookFunction) {
         // ElleKit is NOT auto-mapped into every injected process on Dopamine: TweakInject is only the loader, it
-        // does not export MSHookFunction into our namespace unless ElleKit's own dylib is actually loaded. The
-        // previous assumption ("already loaded, TweakInject can't work without it") was wrong -> MSHookFunction
-        // came back NULL and we bailed. Load ElleKit explicitly, then re-resolve. (Rootless /var/jb paths;
-        // libsubstrate is ElleKit's Substrate-compat alias.)
+        // does not export MSHookFunction into our namespace unless ElleKit's own dylib is actually loaded.
         const char *ek[] = { "/var/jb/usr/lib/libellekit.dylib", "/var/jb/usr/lib/libsubstrate.dylib",
                              "libellekit.dylib", "libsubstrate.dylib", NULL };
         for (int i = 0; ek[i] && !MSHookFunction; i++) {
