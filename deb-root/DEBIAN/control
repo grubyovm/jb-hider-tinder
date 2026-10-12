@@ -1,9 +1,9 @@
-Package: com.duszan.jbhidet
+Package: com.cwel.jbhidet
 Name: JBHideT
 Version: 1.1
 Architecture: iphoneos-arm64
 Priority: optional
 Section: Tweaks
-Maintainer: duszan
-Author: duszan
+Maintainer: cwel
+Author: cwel
 Description: Hides jailbreak-related dyld images from FaceTecSDK's (Tinder) image enumeration. Requires ElleKit (already present on this jailbreak) -- no-ops silently if missing.
