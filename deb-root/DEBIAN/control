@@ -1,5 +1,5 @@
-Package: com.duszan.jbhide
-Name: JBHide
+Package: com.duszan.jbhidet
+Name: JBHideT
 Version: 1.0
 Architecture: iphoneos-arm64
 Priority: optional
