@@ -9,49 +9,49 @@
  *
  *   1. InitFunc_1 (FaceTecSDK+0x18DE38) crashes (BRK @ +0x18E70C, matches
  *      real device crash log 1:1) when ANY MH_DYLIB image has
- *      LC_CODE_SIGNATURE present but no CSMAGIC_BLOBWRAPPER blob. Its
- *      prologue calls the resolved-table primitive idx=135
- *      (_dyld_image_count) before its 121-case dispatcher even starts --
- *      same enumeration pattern as the whole InitFunc_x family
- *      (_dyld_image_count() -> loop _dyld_get_image_header(i)).
+ *      LC_CODE_SIGNATURE present but no CSMAGIC_BLOBWRAPPER blob. CONFIRMED
+ *      via raw disasm (not just a comment) at 0x190648-0x190654: it reads
+ *      the resolved-table pointer for idx=55 (_dyld_get_image_header) and
+ *      calls it with W0=[X23+0x84] (loop index), storing the result at
+ *      [X23+0x3A0]; NULL -> end-of-enumeration state 107.
  *   2. InitFunc_0/2/3/4/5/6/9/10/11/15 fingerprint the SAME image list via
  *      the SAME two primitives (non-crashing -- likely reported server-side
- *      as part of FaceTec's session risk signals, separately confirmed this
- *      session by decompiling the actual JSON upload payload).
- *   3. A SEPARATE ~31-function anti-tamper family (incl. -[oyFDweCB
- *      results], the BR-pattern hook-check self-test on vm_region_recurse_64)
- *      walks the SAME image list via task_info(TASK_DYLD_INFO=17) instead,
- *      through a shared helper (dyldinfo_enum_helper @0x14C2B8).
+ *      as part of FaceTec's session risk signals).
+ *   3. A SEPARATE ~31-function anti-tamper family walks the SAME image list
+ *      via task_info(TASK_DYLD_INFO=17) instead (dyldinfo_enum_helper
+ *      @0x14C2B8).
  *   4. CONFIRMED (manual disasm of every real call site of idx 55/135/8,
- *      incl. inside the "giant" functions): NONE of _dyld_image_count,
- *      _dyld_get_image_header, or task_info is ever fed into the SDK's
- *      BR-pattern inline-hook detector. That check (AND #0xFFFFFC1F; CMP
- *      against the BR-instruction bit pattern 0xD61F0000) is applied
- *      EXCLUSIVELY to the SDK's own vm_region_recurse_64 pointer (idx=225),
- *      across all 47 confirmed call sites. Hooking these three primitives
- *      is therefore not caught by that mechanism.
- *   5. A DIRECT in-place edit of the real dyld_all_image_infos.infoArray
- *      (via Frida Memory.protect+Memory.copy) was tried and failed: the
- *      backing page is hardware write-protected on iOS 18 regardless of
- *      Memory.protect("rwx") -- the write hard-faulted Frida's own agent
- *      thread (gum-js-loop), which hung the app's main thread until
- *      SpringBoard's watchdog SIGKILL'd the process after 10s. This hook
- *      sidesteps that entirely: we never write to the real struct, we
- *      intercept the FUNCTIONS that read it (patched via MSHookFunction,
- *      which rewrites the target's actual machine code -- unlike fishhook,
- *      this is NOT defeated by FaceTecSDK resolving these primitives via
- *      dlsym instead of the normal import table).
+ *      incl. inside the "giant" functions): NONE of these three primitives
+ *      is ever fed into the SDK's BR-pattern inline-hook detector (that
+ *      check is exclusive to vm_region_recurse_64, idx=225). Hooking these
+ *      three is therefore not caught by that mechanism.
+ *   5. A direct in-place edit of the real dyld_all_image_infos.infoArray
+ *      (via Frida) failed: the backing page is hardware write-protected on
+ *      iOS 18 regardless of Memory.protect("rwx"). This hook sidesteps that
+ *      by intercepting the FUNCTIONS instead of writing to the struct.
+ *
+ * STATUS (2026-10-12, live device): dylib confirmed loaded via TweakInject
+ * (present in a real crash log's usedImages), but Tinder still crashed at
+ * the EXACT SAME address (FaceTecSDK+0x18E70C) as before the hook existed.
+ * The hook therefore did not take effect, for an UNCONFIRMED reason -- the
+ * logging below exists to find out which of these is actually happening,
+ * from a real on-disk log file instead of guessing:
+ *   (a) MSHookFunction not found via dlsym at constructor time,
+ *   (b) one or more of the 4 dlsym lookups for the target symbols failing,
+ *   (c) MSHookFunction call(s) silently no-op'ing (e.g. target function too
+ *       short to patch -- a known limitation of inline hooking on very
+ *       short libsystem_kernel.dylib mach-trap stubs),
+ *   (d) hooks installed and firing, but filtering logic wrong,
+ *   (e) hooks installed and firing correctly, but InitFunc_1 reaching the
+ *       crash through some OTHER path entirely (e.g. a different image in
+ *       the list not covered by kBlocked, or a cross-check we haven't
+ *       mapped).
  *
  * Deploy: drop ImageVeil.dylib + ImageVeil.plist (same basename) into
  *   /var/jb/usr/lib/TweakInject/
- * (the TweakInject convention this exact jailbreak already uses --
- * confirmed from the live image dump: .../procursus/usr/lib/TweakInject/
- * already holds Choicy.dylib and 0BadooSpoofer.dylib there).
- *
- * Our own dylib's path also matches the blocklist below ("tweakinject"),
- * so once the hook is active it hides itself from the same enumeration too
- * -- otherwise an ad-hoc-signed dylib with no CMS blob would trip the exact
- * same InitFunc_1 crash we're trying to prevent.
+ * After a crash, read the log:
+ *   cat /var/mobile/jbhide_log.txt
+ * (falls back to $HOME/jbhide_log.txt if that path isn't writable).
  */
 
 #include <stdio.h>
@@ -59,12 +59,41 @@
 #include <string.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdarg.h>
 #include <dlfcn.h>
 #include <pthread.h>
+#include <fcntl.h>
+#include <unistd.h>
 #include <mach/mach.h>
 #include <mach/task_info.h>
 #include <mach-o/dyld.h>
 #include <mach-o/dyld_images.h>
+
+#pragma mark - File-backed diagnostic log
+
+static void JBLog(const char *fmt, ...) {
+    static int fd = -2; // -2 = not yet tried, -1 = failed, >=0 = open
+    if (fd == -2) {
+        fd = open("/var/mobile/jbhide_log.txt", O_WRONLY | O_CREAT | O_APPEND, 0666);
+        if (fd < 0) {
+            const char *home = getenv("HOME");
+            if (home) {
+                char path[512];
+                snprintf(path, sizeof(path), "%s/jbhide_log.txt", home);
+                fd = open(path, O_WRONLY | O_CREAT | O_APPEND, 0666);
+            }
+        }
+        if (fd < 0) fd = -1;
+    }
+    if (fd < 0) return;
+    char buf[1024];
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    if (n > 0) write(fd, buf, (size_t)n);
+    write(fd, "\n", 1);
+}
 
 #pragma mark - MSHookFunction, resolved at runtime (ElleKit is already loaded
 #pragma mark   in-process -- TweakInject can't work without it -- so no SDK
@@ -106,21 +135,30 @@ static void BuildVisibleList(void) {
     uint32_t n = 0;
     for (uint32_t i = 0; i < real; i++) {
         const char *name = orig_dyld_get_image_name ? orig_dyld_get_image_name(i) : NULL;
-        if (!PathBlocked(name)) tmp[n++] = i;
+        bool blocked = PathBlocked(name);
+        JBLog("[BuildVisibleList] i=%u name=%s blocked=%d", i, name ? name : "(null)", blocked);
+        if (!blocked) tmp[n++] = i;
     }
     g_visible = tmp;
     g_visibleCount = n;
+    JBLog("[BuildVisibleList] DONE real=%u visible=%u", real, n);
 }
 
 static uint32_t Hooked_dyld_image_count(void) {
     pthread_once(&g_visibleOnce, BuildVisibleList);
+    JBLog("[Hooked_dyld_image_count] -> %u", g_visibleCount);
     return g_visibleCount;
 }
 
 static const struct mach_header *Hooked_dyld_get_image_header(uint32_t idx) {
     pthread_once(&g_visibleOnce, BuildVisibleList);
-    if (idx >= g_visibleCount) return NULL;
-    return orig_dyld_get_image_header(g_visible[idx]);
+    if (idx >= g_visibleCount) {
+        JBLog("[Hooked_dyld_get_image_header] idx=%u >= visibleCount=%u -> NULL", idx, g_visibleCount);
+        return NULL;
+    }
+    const struct mach_header *h = orig_dyld_get_image_header(g_visible[idx]);
+    JBLog("[Hooked_dyld_get_image_header] idx=%u -> real_idx=%u header=%p", idx, g_visible[idx], h);
+    return h;
 }
 
 static const char *Hooked_dyld_get_image_name(uint32_t idx) {
@@ -140,12 +178,18 @@ static pthread_once_t g_fakeOnce = PTHREAD_ONCE_INIT;
 static void BuildFakeAllImageInfos(void) {
     task_dyld_info_data_t real;
     mach_msg_type_number_t cnt = TASK_DYLD_INFO_COUNT;
-    if (orig_task_info(mach_task_self(), TASK_DYLD_INFO, (task_info_t)&real, &cnt) != KERN_SUCCESS)
+    kern_return_t kr = orig_task_info(mach_task_self(), TASK_DYLD_INFO, (task_info_t)&real, &cnt);
+    if (kr != KERN_SUCCESS) {
+        JBLog("[BuildFakeAllImageInfos] orig_task_info FAILED kr=%d", kr);
         return;
+    }
 
     struct dyld_all_image_infos *realAII =
         (struct dyld_all_image_infos *)real.all_image_info_addr;
-    if (!realAII) return;
+    if (!realAII) {
+        JBLog("[BuildFakeAllImageInfos] realAII is NULL");
+        return;
+    }
 
     uint32_t n = realAII->infoArrayCount;
     struct dyld_image_info *filtered =
@@ -162,6 +206,7 @@ static void BuildFakeAllImageInfos(void) {
     fake->infoArrayCount = kept;
     fake->infoArray = filtered;
     g_fakeAII = fake;
+    JBLog("[BuildFakeAllImageInfos] DONE real=%u kept=%u fakeAII=%p", n, kept, (void *)fake);
 }
 
 static kern_return_t Hooked_task_info(task_t target, task_flavor_t flavor,
@@ -170,7 +215,10 @@ static kern_return_t Hooked_task_info(task_t target, task_flavor_t flavor,
     if (kr == KERN_SUCCESS && flavor == TASK_DYLD_INFO && target == mach_task_self()) {
         pthread_once(&g_fakeOnce, BuildFakeAllImageInfos);
         if (g_fakeAII) {
+            JBLog("[Hooked_task_info] TASK_DYLD_INFO on self -> swapping in fakeAII=%p", (void *)g_fakeAII);
             ((task_dyld_info_t)info)->all_image_info_addr = (uint64_t)g_fakeAII;
+        } else {
+            JBLog("[Hooked_task_info] TASK_DYLD_INFO on self but g_fakeAII is NULL -- passing real struct through");
         }
     }
     return kr;
@@ -180,21 +228,39 @@ static kern_return_t Hooked_task_info(task_t target, task_flavor_t flavor,
 
 __attribute__((constructor))
 static void ImageVeilInit(void) {
+    JBLog("===== ImageVeilInit START pid=%d =====", getpid());
+
     MSHookFunction_t MSHookFunction =
         (MSHookFunction_t)dlsym(RTLD_DEFAULT, "MSHookFunction");
-    if (!MSHookFunction) return; // ElleKit not present in this process -- bail out quietly
+    JBLog("MSHookFunction @ %p", (void *)MSHookFunction);
+    if (!MSHookFunction) {
+        JBLog("ElleKit not present in this process -- bailing out");
+        return;
+    }
 
     void *p_count    = dlsym(RTLD_DEFAULT, "_dyld_image_count");
     void *p_header   = dlsym(RTLD_DEFAULT, "_dyld_get_image_header");
     void *p_name     = dlsym(RTLD_DEFAULT, "_dyld_get_image_name");
     void *p_taskinfo = dlsym(RTLD_DEFAULT, "task_info");
+    JBLog("dlsym: _dyld_image_count=%p _dyld_get_image_header=%p _dyld_get_image_name=%p task_info=%p",
+          p_count, p_header, p_name, p_taskinfo);
 
-    if (p_count)
+    if (p_count) {
         MSHookFunction(p_count, (void *)Hooked_dyld_image_count, (void **)&orig_dyld_image_count);
-    if (p_header)
+        JBLog("hooked _dyld_image_count, orig=%p", (void *)orig_dyld_image_count);
+    }
+    if (p_header) {
         MSHookFunction(p_header, (void *)Hooked_dyld_get_image_header, (void **)&orig_dyld_get_image_header);
-    if (p_name)
+        JBLog("hooked _dyld_get_image_header, orig=%p", (void *)orig_dyld_get_image_header);
+    }
+    if (p_name) {
         MSHookFunction(p_name, (void *)Hooked_dyld_get_image_name, (void **)&orig_dyld_get_image_name);
-    if (p_taskinfo)
+        JBLog("hooked _dyld_get_image_name, orig=%p", (void *)orig_dyld_get_image_name);
+    }
+    if (p_taskinfo) {
         MSHookFunction(p_taskinfo, (void *)Hooked_task_info, (void **)&orig_task_info);
+        JBLog("hooked task_info, orig=%p", (void *)orig_task_info);
+    }
+
+    JBLog("===== ImageVeilInit DONE =====");
 }
