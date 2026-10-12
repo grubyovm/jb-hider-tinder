@@ -1,0 +1,49 @@
+name: Build JBHide tweak
+
+on:
+  push:
+    paths:
+      - "JBHide.c"
+      - "JBHide.plist"
+      - ".github/workflows/build.yml"
+  workflow_dispatch: {}
+
+jobs:
+  build:
+    # Needs a real Xcode toolchain (iOS SDK) -- only macOS runners have one.
+    runs-on: macos-14
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Select Xcode
+        run: sudo xcode-select -s /Applications/Xcode.app
+
+      - name: Build arm64 dylib
+        run: |
+          SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
+          echo "Using SDK: $SDK"
+          clang -arch arm64 \
+            -isysroot "$SDK" \
+            -miphoneos-version-min=14.0 \
+            -dynamiclib \
+            -Wall -Wextra \
+            -o JBHide.dylib \
+            JBHide.c
+
+      - name: Ad-hoc codesign
+        run: |
+          codesign -s - --timestamp=none -f JBHide.dylib
+          codesign -dv JBHide.dylib
+
+      - name: Package
+        run: |
+          mkdir -p dist
+          cp JBHide.dylib dist/
+          cp JBHide.plist dist/
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: JBHide-tweak
+          path: dist/
