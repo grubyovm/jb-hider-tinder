@@ -49,10 +49,12 @@
  *
  * Deploy: drop ImageVeil.dylib + ImageVeil.plist (same basename) into
  *   /var/jb/usr/lib/TweakInject/
- * After a crash, read the log:
- *   cat /var/jb/var/mobile/jbhide_log.txt
- * (/var/mobile itself is raw rootfs and NOT writable from the app sandbox -- only
- *  /var/jb is, via Dopamine's rw extension; falls back to $HOME if ever needed).
+ * After a crash, read the log from the app's OWN Data container (the only place a
+ * sandboxed app can reliably write -- NOT /var/mobile, NOT /var/jb). On the device:
+ *   find /var/mobile/Containers/Data/Application -name jbhide_log.txt
+ *   cat  <the path it prints>
+ * (path is .../Data/Application/<GUID>/Documents/jbhide_log.txt; the GUID changes
+ *  per install, so use find rather than hardcoding it).
  */
 
 #include <stdio.h>
@@ -74,25 +76,34 @@
 #pragma mark - File-backed diagnostic log
 
 static void JBLog(const char *fmt, ...) {
+    // Write into the app's OWN Data container, which a sandboxed app can ALWAYS write to (no jailbreak path, no
+    // /var/jb, no /var/mobile rootfs). The container path is resolved at runtime via NSHomeDirectory() (looked up
+    // with dlsym -- Foundation is already loaded in Tinder, so nothing extra needs to be linked at build time).
+    // We do NOT use getenv("HOME") -- it is unreliable in this process. Resulting file:
+    //   /var/mobile/Containers/Data/Application/<GUID>/Documents/jbhide_log.txt
+    // Find it on the device (shell / Filza):
+    //   find /var/mobile/Containers/Data/Application -name jbhide_log.txt
     static int fd = -2; // -2 = not yet tried, -1 = failed, >=0 = open
     if (fd == -2) {
-        // /var/mobile is RAW rootfs: a sandboxed app has NO write extension there. Dopamine grants every
-        // process a read-write sandbox extension for JBROOT ("/var/jb/var/mobile" and the rest of "/var/jb"),
-        // so the log MUST live under /var/jb to be writable from inside Tinder. (Same trap dzaga documents.)
-        fd = open("/var/jb/var/mobile/jbhide_log.txt", O_WRONLY | O_CREAT | O_APPEND, 0666);
-        if (fd < 0) fd = open("/var/jb/jbhide_log.txt", O_WRONLY | O_CREAT | O_APPEND, 0666);
-        if (fd < 0) {
-            // last resort: the app's OWN data container ($HOME) is writable too, but only if HOME really points
-            // at the container (not /var/mobile) -- so it's the fallback, not the primary.
-            const char *home = getenv("HOME");
-            if (home && strncmp(home, "/var/mobile", 11) != 0) {
-                char path[512];
-                snprintf(path, sizeof(path), "%s/jbhide_log.txt", home);
+        fd = -1;
+        void *(*p_home)(void)        = (void *(*)(void))dlsym(RTLD_DEFAULT, "NSHomeDirectory");
+        void *(*p_msgSend)(void *, void *) = (void *(*)(void *, void *))dlsym(RTLD_DEFAULT, "objc_msgSend");
+        void *(*p_sel)(const char *) = (void *(*)(const char *))dlsym(RTLD_DEFAULT, "sel_registerName");
+        if (p_home && p_msgSend && p_sel) {
+            void *home = p_home();   // NSString* = this app's sandbox container
+            const char *(*msg_cstr)(void *, void *) = (const char *(*)(void *, void *))p_msgSend;
+            const char *base = home ? msg_cstr(home, p_sel("fileSystemRepresentation")) : NULL;
+            if (base && base[0]) {
+                char path[1024];
+                snprintf(path, sizeof(path), "%s/Documents/jbhide_log.txt", base);
                 fd = open(path, O_WRONLY | O_CREAT | O_APPEND, 0666);
+                if (fd < 0) {   // no Documents? fall back to the container root
+                    snprintf(path, sizeof(path), "%s/jbhide_log.txt", base);
+                    fd = open(path, O_WRONLY | O_CREAT | O_APPEND, 0666);
+                }
+                if (fd >= 0) fchmod(fd, 0666);
             }
         }
-        if (fd >= 0) fchmod(fd, 0666);   // make it readable/removable from the manager/shell later
-        if (fd < 0) fd = -1;
     }
     if (fd < 0) return;
     char buf[1024];
