@@ -50,8 +50,9 @@
  * Deploy: drop ImageVeil.dylib + ImageVeil.plist (same basename) into
  *   /var/jb/usr/lib/TweakInject/
  * After a crash, read the log:
- *   cat /var/mobile/jbhide_log.txt
- * (falls back to $HOME/jbhide_log.txt if that path isn't writable).
+ *   cat /var/jb/var/mobile/jbhide_log.txt
+ * (/var/mobile itself is raw rootfs and NOT writable from the app sandbox -- only
+ *  /var/jb is, via Dopamine's rw extension; falls back to $HOME if ever needed).
  */
 
 #include <stdio.h>
@@ -64,6 +65,7 @@
 #include <pthread.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <sys/stat.h>
 #include <mach/mach.h>
 #include <mach/task_info.h>
 #include <mach-o/dyld.h>
@@ -74,15 +76,22 @@
 static void JBLog(const char *fmt, ...) {
     static int fd = -2; // -2 = not yet tried, -1 = failed, >=0 = open
     if (fd == -2) {
-        fd = open("/var/mobile/jbhide_log.txt", O_WRONLY | O_CREAT | O_APPEND, 0666);
+        // /var/mobile is RAW rootfs: a sandboxed app has NO write extension there. Dopamine grants every
+        // process a read-write sandbox extension for JBROOT ("/var/jb/var/mobile" and the rest of "/var/jb"),
+        // so the log MUST live under /var/jb to be writable from inside Tinder. (Same trap dzaga documents.)
+        fd = open("/var/jb/var/mobile/jbhide_log.txt", O_WRONLY | O_CREAT | O_APPEND, 0666);
+        if (fd < 0) fd = open("/var/jb/jbhide_log.txt", O_WRONLY | O_CREAT | O_APPEND, 0666);
         if (fd < 0) {
+            // last resort: the app's OWN data container ($HOME) is writable too, but only if HOME really points
+            // at the container (not /var/mobile) -- so it's the fallback, not the primary.
             const char *home = getenv("HOME");
-            if (home) {
+            if (home && strncmp(home, "/var/mobile", 11) != 0) {
                 char path[512];
                 snprintf(path, sizeof(path), "%s/jbhide_log.txt", home);
                 fd = open(path, O_WRONLY | O_CREAT | O_APPEND, 0666);
             }
         }
+        if (fd >= 0) fchmod(fd, 0666);   // make it readable/removable from the manager/shell later
         if (fd < 0) fd = -1;
     }
     if (fd < 0) return;
