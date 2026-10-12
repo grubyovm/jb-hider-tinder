@@ -5,6 +5,7 @@ on:
     paths:
       - "JBHide.c"
       - "JBHide.plist"
+      - "deb-root/**"
       - ".github/workflows/build.yml"
   workflow_dispatch: {}
 
@@ -36,11 +37,29 @@ jobs:
           codesign -s - --timestamp=none -f JBHide.dylib
           codesign -dv JBHide.dylib
 
-      - name: Package
+      - name: Install dpkg-deb
+        run: brew install dpkg
+
+      - name: Assemble .deb package root
+        run: |
+          mkdir -p deb-root/usr/lib/TweakInject
+          cp JBHide.dylib deb-root/usr/lib/TweakInject/
+          cp JBHide.plist deb-root/usr/lib/TweakInject/
+          chmod 0755 deb-root/DEBIAN
+          chmod 0644 deb-root/DEBIAN/control
+
+      - name: Build .deb
+        run: |
+          dpkg-deb --build --root-owner-group deb-root com.duszan.jbhide_1.0_iphoneos-arm64.deb
+          dpkg-deb --info com.duszan.jbhide_1.0_iphoneos-arm64.deb
+          dpkg-deb --contents com.duszan.jbhide_1.0_iphoneos-arm64.deb
+
+      - name: Package raw dylib too (manual-copy fallback)
         run: |
           mkdir -p dist
           cp JBHide.dylib dist/
           cp JBHide.plist dist/
+          cp com.duszan.jbhide_1.0_iphoneos-arm64.deb dist/
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
