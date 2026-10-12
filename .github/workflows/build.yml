@@ -42,14 +42,18 @@ jobs:
 
       - name: Assemble .deb package root
         run: |
-          mkdir -p deb-root/usr/lib/TweakInject
-          cp ImageVeil.dylib deb-root/usr/lib/TweakInject/
+          # ROOTLESS jailbreak (Dopamine/ElleKit): TweakInject loads tweaks
+          # from /var/jb/usr/lib/TweakInject/ -- so the package MUST install
+          # there, not /usr/lib/TweakInject/. Installing to the bare /usr path
+          # succeeds silently but the dylib never gets injected.
+          mkdir -p deb-root/var/jb/usr/lib/TweakInject
+          cp ImageVeil.dylib deb-root/var/jb/usr/lib/TweakInject/
           # Generated inline (OpenStep-style filter plist, NOT XML plist --
           # TweakInject's loader expects the old Substrate `{ Filter = ...}`
           # format). Written here directly so the package is always correct
           # even if ImageVeil.plist is missing/stale in the checkout.
           printf '%s\n' '{ Filter = { Bundles = ( "com.cardify.tinder" ); }; }' \
-            > deb-root/usr/lib/TweakInject/ImageVeil.plist
+            > deb-root/var/jb/usr/lib/TweakInject/ImageVeil.plist
           chmod 0755 deb-root/DEBIAN
           chmod 0644 deb-root/DEBIAN/control
 
@@ -60,13 +64,13 @@ jobs:
           echo "---- contents ----"
           dpkg-deb --contents com.duszan.imgveil_1.0_iphoneos-arm64.deb
           echo "---- plist as packaged ----"
-          dpkg-deb --fsys-tarfile com.duszan.imgveil_1.0_iphoneos-arm64.deb | tar -xO ./usr/lib/TweakInject/ImageVeil.plist
+          dpkg-deb --fsys-tarfile com.duszan.imgveil_1.0_iphoneos-arm64.deb | tar -xO ./var/jb/usr/lib/TweakInject/ImageVeil.plist
 
       - name: Package raw dylib too (manual-copy fallback)
         run: |
           mkdir -p dist
-          cp deb-root/usr/lib/TweakInject/ImageVeil.dylib dist/
-          cp deb-root/usr/lib/TweakInject/ImageVeil.plist dist/
+          cp deb-root/var/jb/usr/lib/TweakInject/ImageVeil.dylib dist/
+          cp deb-root/var/jb/usr/lib/TweakInject/ImageVeil.plist dist/
           cp com.duszan.imgveil_1.0_iphoneos-arm64.deb dist/
 
       - name: Upload artifact
