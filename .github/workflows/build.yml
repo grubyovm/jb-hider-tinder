@@ -44,7 +44,12 @@ jobs:
         run: |
           mkdir -p deb-root/usr/lib/TweakInject
           cp JBHide.dylib deb-root/usr/lib/TweakInject/
-          cp JBHide.plist deb-root/usr/lib/TweakInject/
+          # Generated inline (OpenStep-style filter plist, NOT XML plist --
+          # TweakInject's loader expects the old Substrate `{ Filter = ...}`
+          # format). Written here directly so the package is always correct
+          # even if JBHide.plist is missing/stale in the checkout.
+          printf '%s\n' '{ Filter = { Bundles = ( "com.cardify.tinder" ); }; }' \
+            > deb-root/usr/lib/TweakInject/JBHide.plist
           chmod 0755 deb-root/DEBIAN
           chmod 0644 deb-root/DEBIAN/control
 
@@ -52,13 +57,16 @@ jobs:
         run: |
           dpkg-deb --build --root-owner-group deb-root com.duszan.jbhide_1.0_iphoneos-arm64.deb
           dpkg-deb --info com.duszan.jbhide_1.0_iphoneos-arm64.deb
+          echo "---- contents ----"
           dpkg-deb --contents com.duszan.jbhide_1.0_iphoneos-arm64.deb
+          echo "---- plist as packaged ----"
+          dpkg-deb --fsys-tarfile com.duszan.jbhide_1.0_iphoneos-arm64.deb | tar -xO ./usr/lib/TweakInject/JBHide.plist
 
       - name: Package raw dylib too (manual-copy fallback)
         run: |
           mkdir -p dist
-          cp JBHide.dylib dist/
-          cp JBHide.plist dist/
+          cp deb-root/usr/lib/TweakInject/JBHide.dylib dist/
+          cp deb-root/usr/lib/TweakInject/JBHide.plist dist/
           cp com.duszan.jbhide_1.0_iphoneos-arm64.deb dist/
 
       - name: Upload artifact
