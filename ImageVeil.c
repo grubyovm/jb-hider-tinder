@@ -252,9 +252,23 @@ static void ImageVeilInit(void) {
 
     MSHookFunction_t MSHookFunction =
         (MSHookFunction_t)dlsym(RTLD_DEFAULT, "MSHookFunction");
+    if (!MSHookFunction) {
+        // ElleKit is NOT auto-mapped into every injected process on Dopamine: TweakInject is only the loader, it
+        // does not export MSHookFunction into our namespace unless ElleKit's own dylib is actually loaded. The
+        // previous assumption ("already loaded, TweakInject can't work without it") was wrong -> MSHookFunction
+        // came back NULL and we bailed. Load ElleKit explicitly, then re-resolve. (Rootless /var/jb paths;
+        // libsubstrate is ElleKit's Substrate-compat alias.)
+        const char *ek[] = { "/var/jb/usr/lib/libellekit.dylib", "/var/jb/usr/lib/libsubstrate.dylib",
+                             "libellekit.dylib", "libsubstrate.dylib", NULL };
+        for (int i = 0; ek[i] && !MSHookFunction; i++) {
+            void *h = dlopen(ek[i], RTLD_NOW | RTLD_GLOBAL);
+            JBLog("dlopen(%s) = %p", ek[i], h);
+            MSHookFunction = (MSHookFunction_t)dlsym(RTLD_DEFAULT, "MSHookFunction");
+        }
+    }
     JBLog("MSHookFunction @ %p", (void *)MSHookFunction);
     if (!MSHookFunction) {
-        JBLog("ElleKit not present in this process -- bailing out");
+        JBLog("ElleKit could not be loaded -- bailing out");
         return;
     }
 
