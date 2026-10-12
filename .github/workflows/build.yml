@@ -1,10 +1,10 @@
-name: Build JBHide tweak
+name: Build ImageVeil tweak
 
 on:
   push:
     paths:
-      - "JBHideT.c"
-      - "JBHideT.plist"
+      - "ImageVeil.c"
+      - "ImageVeil.plist"
       - "deb-root/**"
       - ".github/workflows/build.yml"
   workflow_dispatch: {}
@@ -29,13 +29,13 @@ jobs:
             -miphoneos-version-min=14.0 \
             -dynamiclib \
             -Wall -Wextra \
-            -o JBHideT.dylib \
-            JBHideT.c
+            -o ImageVeil.dylib \
+            ImageVeil.c
 
       - name: Ad-hoc codesign
         run: |
-          codesign -s - --timestamp=none -f JBHideT.dylib
-          codesign -dv JBHideT.dylib
+          codesign -s - --timestamp=none -f ImageVeil.dylib
+          codesign -dv ImageVeil.dylib
 
       - name: Install dpkg-deb
         run: brew install dpkg
@@ -43,34 +43,34 @@ jobs:
       - name: Assemble .deb package root
         run: |
           mkdir -p deb-root/usr/lib/TweakInject
-          cp JBHideT.dylib deb-root/usr/lib/TweakInject/
+          cp ImageVeil.dylib deb-root/usr/lib/TweakInject/
           # Generated inline (OpenStep-style filter plist, NOT XML plist --
           # TweakInject's loader expects the old Substrate `{ Filter = ...}`
           # format). Written here directly so the package is always correct
-          # even if JBHideT.plist is missing/stale in the checkout.
+          # even if ImageVeil.plist is missing/stale in the checkout.
           printf '%s\n' '{ Filter = { Bundles = ( "com.cardify.tinder" ); }; }' \
-            > deb-root/usr/lib/TweakInject/JBHideT.plist
+            > deb-root/usr/lib/TweakInject/ImageVeil.plist
           chmod 0755 deb-root/DEBIAN
           chmod 0644 deb-root/DEBIAN/control
 
       - name: Build .deb
         run: |
-          dpkg-deb --build --root-owner-group deb-root com.duszan.jbhideT_1.0_iphoneos-arm64.deb
-          dpkg-deb --info com.duszan.jbhideT_1.0_iphoneos-arm64.deb
+          dpkg-deb --build --root-owner-group deb-root com.duszan.imgveil_1.0_iphoneos-arm64.deb
+          dpkg-deb --info com.duszan.imgveil_1.0_iphoneos-arm64.deb
           echo "---- contents ----"
-          dpkg-deb --contents com.duszan.jbhideT_1.0_iphoneos-arm64.deb
+          dpkg-deb --contents com.duszan.imgveil_1.0_iphoneos-arm64.deb
           echo "---- plist as packaged ----"
-          dpkg-deb --fsys-tarfile com.duszan.jbhideT_1.0_iphoneos-arm64.deb | tar -xO ./usr/lib/TweakInject/JBHideT.plist
+          dpkg-deb --fsys-tarfile com.duszan.imgveil_1.0_iphoneos-arm64.deb | tar -xO ./usr/lib/TweakInject/ImageVeil.plist
 
       - name: Package raw dylib too (manual-copy fallback)
         run: |
           mkdir -p dist
-          cp deb-root/usr/lib/TweakInject/JBHideT.dylib dist/
-          cp deb-root/usr/lib/TweakInject/JBHideT.plist dist/
-          cp com.duszan.jbhideT_1.0_iphoneos-arm64.deb dist/
+          cp deb-root/usr/lib/TweakInject/ImageVeil.dylib dist/
+          cp deb-root/usr/lib/TweakInject/ImageVeil.plist dist/
+          cp com.duszan.imgveil_1.0_iphoneos-arm64.deb dist/
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: JBHideT-tweak
+          name: ImageVeil-tweak
           path: dist/
